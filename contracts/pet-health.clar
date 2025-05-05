@@ -251,3 +251,78 @@
     (ok true)
   )
 )
+
+
+
+(define-map health-records 
+  { policy-id: uint, record-id: uint }
+  {
+    vet-id: uint,
+    record-type: (string-ascii 32),
+    description: (string-ascii 256),
+    timestamp: uint
+  }
+)
+
+(define-map policy-records
+  { policy-id: uint }
+  { record-count: uint }
+)
+
+(define-read-only (get-health-record (policy-id uint) (record-id uint))
+  (map-get? health-records { policy-id: policy-id, record-id: record-id })
+)
+
+(define-public (add-health-record 
+    (policy-id uint)
+    (record-type (string-ascii 32))
+    (description (string-ascii 256)))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+      (vet-data (unwrap! (map-get? vet-principals { principal: tx-sender }) err-not-vet))
+      (records (default-to { record-count: u0 } (map-get? policy-records { policy-id: policy-id })))
+      (record-id (get record-count records))
+    )
+    (asserts! (get active policy) err-unauthorized)
+    
+    (map-set health-records
+      { policy-id: policy-id, record-id: record-id }
+      {
+        vet-id: (get vet-id vet-data),
+        record-type: record-type,
+        description: description,
+        timestamp: stacks-block-height
+      }
+    )
+    
+    (map-set policy-records
+      { policy-id: policy-id }
+      { record-count: (+ record-id u1) }
+    )
+    
+    (ok record-id)
+  )
+)
+
+
+(define-constant err-transfer-not-allowed (err u109))
+
+(define-public (transfer-policy (policy-id uint) (new-owner principal))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get owner policy)) err-unauthorized)
+    (asserts! (get active policy) err-unauthorized)
+    
+    (try! (nft-transfer? pet-policy policy-id tx-sender new-owner))
+    
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy { owner: new-owner })
+    )
+    
+    (ok true)
+  )
+)
