@@ -15,16 +15,8 @@
 (define-data-var next-vet-id uint u1)
 (define-data-var claim-fee uint u10000000) ;; 10 STX
 
-
-(define-constant err-owner-only (err u100))
-(define-constant err-not-found (err u101))
-(define-constant err-unauthorized (err u102))
-(define-constant err-invalid-amount (err u106))
-(define-constant err-policy-expired (err u104))
-
 (define-constant max-discount-percentage u30)
 (define-constant records-for-max-discount u12)
-(define-constant contract-owner tx-sender)
 
 (define-map policy-discounts
   { policy-id: uint }
@@ -423,16 +415,16 @@
 (define-read-only (get-policy-record-count (policy-id uint))
   (let
     (
-      (records (contract-call? .pet-health get-policy-records-count policy-id))
+      (records (get-policy-records-count policy-id))
     )
-    (default-to u0 (get record-count records))
+    (get record-count records)
   )
 )
 
 (define-public (update-policy-discount (policy-id uint))
   (let
     (
-      (policy (unwrap! (contract-call? .pet-health get-policy policy-id) err-not-found))
+      (policy (unwrap! (get-policy policy-id) err-not-found))
       (current-records (get-policy-record-count policy-id))
       (new-discount (calculate-discount-percentage current-records))
     )
@@ -457,7 +449,7 @@
     (duration-blocks uint))
   (let
     (
-      (policy (unwrap! (contract-call? .pet-health get-policy policy-id) err-not-found))
+      (policy (unwrap! (get-policy policy-id) err-not-found))
       (discount-data (get-policy-discount policy-id))
       (discount-percentage (match discount-data
         data (get current-discount data)
@@ -470,7 +462,7 @@
     
     (try! (stx-transfer? discounted-premium tx-sender contract-owner))
     
-    (try! (contract-call? .pet-health extend-policy policy-id duration-blocks))
+    (try! (extend-policy policy-id duration-blocks))
     
     (ok {
       original-premium: new-premium,
@@ -491,7 +483,7 @@
     (max-claims uint))
   (let
     (
-      (policy-result (try! (contract-call? .pet-health create-policy 
+      (policy-result (try! (create-policy 
         pet-name pet-species pet-age coverage-amount premium-amount duration-blocks max-claims)))
     )
     (map-set policy-discounts
@@ -559,6 +551,279 @@
 
 (define-read-only (get-discount-calculation-fee)
   (var-get discount-calculation-fee)
+)
+
+(define-constant err-insufficient-emergency-funds (err u110))
+(define-constant err-emergency-request-exists (err u111))
+(define-constant err-emergency-request-not-found (err u112))
+(define-constant err-voting-ended (err u113))
+(define-constant err-already-voted (err u114))
+(define-constant err-self-vote (err u115))
+(define-constant err-insufficient-contribution (err u116))
+(define-constant err-emergency-not-approved (err u117))
+(define-constant err-emergency-expired (err u118))
+(define-constant err-emergency-already-funded (err u119))
+
+(define-data-var emergency-fund-balance uint u0)
+(define-data-var next-emergency-id uint u1)
+(define-data-var min-emergency-contribution uint u1000000)
+(define-data-var emergency-voting-period uint u144)
+(define-data-var min-votes-required uint u3)
+
+(define-map emergency-requests
+  { emergency-id: uint }
+  {
+    policy-id: uint,
+    requester: principal,
+    amount-requested: uint,
+    description: (string-ascii 256),
+    vet-verification: principal,
+    created-at: uint,
+    voting-ends-at: uint,
+    yes-votes: uint,
+    no-votes: uint,
+    approved: bool,
+    funded: bool,
+    total-funded: uint
+  }
+)
+
+(define-map emergency-votes
+  { emergency-id: uint, voter: principal }
+  { vote: bool, timestamp: uint }
+)
+
+(define-map emergency-contributors
+  { contributor: principal }
+  {
+    total-contributed: uint,
+    contribution-count: uint,
+    last-contribution: uint
+  }
+)
+
+(define-map emergency-fund-contributions
+  { emergency-id: uint, contributor: principal }
+  { amount: uint, timestamp: uint }
+)
+
+(define-map policy-emergency-requests
+  { policy-id: uint }
+  { request-count: uint }
+)
+
+(define-read-only (get-emergency-fund-balance)
+  (var-get emergency-fund-balance)
+)
+
+(define-read-only (get-emergency-request (emergency-id uint))
+  (map-get? emergency-requests { emergency-id: emergency-id })
+)
+
+(define-read-only (get-emergency-vote (emergency-id uint) (voter principal))
+  (map-get? emergency-votes { emergency-id: emergency-id, voter: voter })
+)
+
+(define-read-only (get-contributor-stats (contributor principal))
+  (map-get? emergency-contributors { contributor: contributor })
+)
+
+(define-read-only (get-emergency-settings)
+  {
+    min-contribution: (var-get min-emergency-contribution),
+    voting-period: (var-get emergency-voting-period),
+    min-votes-required: (var-get min-votes-required)
+  }
+)
+
+(define-public (contribute-to-emergency-fund (amount uint))
+  (let
+    (
+      (current-contributor (default-to
+        { total-contributed: u0, contribution-count: u0, last-contribution: u0 }
+        (map-get? emergency-contributors { contributor: tx-sender })))
+    )
+    (asserts! (>= amount (var-get min-emergency-contribution)) err-insufficient-contribution)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (var-set emergency-fund-balance (+ (var-get emergency-fund-balance) amount))
+    
+    (map-set emergency-contributors
+      { contributor: tx-sender }
+      {
+        total-contributed: (+ (get total-contributed current-contributor) amount),
+        contribution-count: (+ (get contribution-count current-contributor) u1),
+        last-contribution: stacks-block-height
+      }
+    )
+    
+    (ok amount)
+  )
+)
+
+(define-public (request-emergency-funding
+    (policy-id uint)
+    (amount uint)
+    (description (string-ascii 256)))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+      (emergency-id (var-get next-emergency-id))
+      (voting-ends (+ stacks-block-height (var-get emergency-voting-period)))
+      (request-count (default-to { request-count: u0 } 
+        (map-get? policy-emergency-requests { policy-id: policy-id })))
+    )
+    (asserts! (is-eq (get owner policy) tx-sender) err-unauthorized)
+    (asserts! (get active policy) err-unauthorized)
+    (asserts! (> amount u0) err-invalid-amount)
+    
+    (map-set emergency-requests
+      { emergency-id: emergency-id }
+      {
+        policy-id: policy-id,
+        requester: tx-sender,
+        amount-requested: amount,
+        description: description,
+        vet-verification: tx-sender,
+        created-at: stacks-block-height,
+        voting-ends-at: voting-ends,
+        yes-votes: u0,
+        no-votes: u0,
+        approved: false,
+        funded: false,
+        total-funded: u0
+      }
+    )
+    
+    (map-set policy-emergency-requests
+      { policy-id: policy-id }
+      { request-count: (+ (get request-count request-count) u1) }
+    )
+    
+    (var-set next-emergency-id (+ emergency-id u1))
+    (ok emergency-id)
+  )
+)
+
+(define-public (vote-on-emergency-request (emergency-id uint) (vote bool))
+  (let
+    (
+      (emergency-request (unwrap! (map-get? emergency-requests { emergency-id: emergency-id }) err-emergency-request-not-found))
+      (contributor-data (unwrap! (map-get? emergency-contributors { contributor: tx-sender }) err-unauthorized))
+    )
+    (asserts! (<= stacks-block-height (get voting-ends-at emergency-request)) err-voting-ended)
+    (asserts! (not (is-eq tx-sender (get requester emergency-request))) err-self-vote)
+    (asserts! (is-none (map-get? emergency-votes { emergency-id: emergency-id, voter: tx-sender })) err-already-voted)
+    
+    (map-set emergency-votes
+      { emergency-id: emergency-id, voter: tx-sender }
+      { vote: vote, timestamp: stacks-block-height }
+    )
+    
+    (if vote
+      (map-set emergency-requests
+        { emergency-id: emergency-id }
+        (merge emergency-request { yes-votes: (+ (get yes-votes emergency-request) u1) }))
+      (map-set emergency-requests
+        { emergency-id: emergency-id }
+        (merge emergency-request { no-votes: (+ (get no-votes emergency-request) u1) }))
+    )
+    
+    (ok vote)
+  )
+)
+
+(define-public (finalize-emergency-request (emergency-id uint))
+  (let
+    (
+      (emergency-request (unwrap! (map-get? emergency-requests { emergency-id: emergency-id }) err-emergency-request-not-found))
+      (total-votes (+ (get yes-votes emergency-request) (get no-votes emergency-request)))
+      (approved (and 
+        (>= total-votes (var-get min-votes-required))
+        (> (get yes-votes emergency-request) (get no-votes emergency-request))))
+    )
+    (asserts! (> stacks-block-height (get voting-ends-at emergency-request)) err-voting-ended)
+    (asserts! (not (get approved emergency-request)) err-emergency-request-exists)
+    
+    (map-set emergency-requests
+      { emergency-id: emergency-id }
+      (merge emergency-request { approved: approved })
+    )
+    
+    (ok approved)
+  )
+)
+
+(define-public (fund-emergency-request (emergency-id uint))
+  (let
+    (
+      (emergency-request (unwrap! (map-get? emergency-requests { emergency-id: emergency-id }) err-emergency-request-not-found))
+      (policy (unwrap! (map-get? policies { policy-id: (get policy-id emergency-request) }) err-not-found))
+      (amount (get amount-requested emergency-request))
+    )
+    (asserts! (get approved emergency-request) err-emergency-not-approved)
+    (asserts! (not (get funded emergency-request)) err-emergency-already-funded)
+    (asserts! (>= (var-get emergency-fund-balance) amount) err-insufficient-emergency-funds)
+    
+    (try! (as-contract (stx-transfer? amount tx-sender (get owner policy))))
+    
+    (var-set emergency-fund-balance (- (var-get emergency-fund-balance) amount))
+    
+    (map-set emergency-requests
+      { emergency-id: emergency-id }
+      (merge emergency-request { funded: true, total-funded: amount })
+    )
+    
+    (ok amount)
+  )
+)
+
+(define-public (set-emergency-settings
+    (min-contribution uint)
+    (voting-period uint)
+    (min-votes uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> min-contribution u0) err-invalid-amount)
+    (asserts! (> voting-period u0) err-invalid-amount)
+    (asserts! (> min-votes u0) err-invalid-amount)
+    
+    (var-set min-emergency-contribution min-contribution)
+    (var-set emergency-voting-period voting-period)
+    (var-set min-votes-required min-votes)
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-emergency-request-stats (emergency-id uint))
+  (match (map-get? emergency-requests { emergency-id: emergency-id })
+    emergency-request
+    (let
+      (
+        (total-votes (+ (get yes-votes emergency-request) (get no-votes emergency-request)))
+        (voting-still-open (<= stacks-block-height (get voting-ends-at emergency-request)))
+      )
+      (some {
+        total-votes: total-votes,
+        yes-percentage: (if (> total-votes u0) (/ (* (get yes-votes emergency-request) u100) total-votes) u0),
+        voting-still-open: voting-still-open,
+        blocks-remaining: (if voting-still-open 
+          (- (get voting-ends-at emergency-request) stacks-block-height) 
+          u0)
+      })
+    )
+    none
+  )
+)
+
+(define-read-only (get-emergency-funding-summary)
+  {
+    total-fund-balance: (var-get emergency-fund-balance),
+    total-requests: (- (var-get next-emergency-id) u1),
+    settings: (get-emergency-settings)
+  }
 )
 
 (init-discount-tiers)
