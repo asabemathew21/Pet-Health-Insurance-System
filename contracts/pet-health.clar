@@ -826,4 +826,337 @@
   }
 )
 
+(define-constant err-wellness-calculation-failed (err u120))
+(define-constant err-invalid-wellness-tier (err u121))
+(define-constant err-wellness-not-updated (err u122))
+
+(define-data-var base-wellness-score uint u50)
+(define-data-var max-wellness-score uint u100)
+(define-data-var wellness-decay-rate uint u5)
+(define-data-var checkup-score-bonus uint u15)
+(define-data-var vaccination-score-bonus uint u10)
+(define-data-var preventive-care-bonus uint u8)
+
+(define-map pet-wellness-scores
+  { policy-id: uint }
+  {
+    current-score: uint,
+    last-updated: uint,
+    total-checkups: uint,
+    recent-checkups: uint,
+    vaccination-status: uint,
+    preventive-care-count: uint,
+    wellness-tier: uint,
+    premium-discount: uint
+  }
+)
+
+(define-map wellness-tier-thresholds
+  { tier: uint }
+  {
+    min-score: uint,
+    max-score: uint,
+    premium-discount: uint,
+    tier-name: (string-ascii 20)
+  }
+)
+
+(define-map wellness-activities
+  { policy-id: uint, activity-id: uint }
+  {
+    activity-type: (string-ascii 32),
+    score-impact: uint,
+    recorded-by: principal,
+    timestamp: uint,
+    description: (string-ascii 128)
+  }
+)
+
+(define-map policy-wellness-activities
+  { policy-id: uint }
+  { activity-count: uint }
+)
+
+(define-private (init-wellness-tiers)
+  (begin
+    (map-set wellness-tier-thresholds { tier: u1 } 
+      { min-score: u0, max-score: u30, premium-discount: u0, tier-name: "At Risk" })
+    (map-set wellness-tier-thresholds { tier: u2 } 
+      { min-score: u31, max-score: u50, premium-discount: u5, tier-name: "Basic" })
+    (map-set wellness-tier-thresholds { tier: u3 } 
+      { min-score: u51, max-score: u70, premium-discount: u10, tier-name: "Good" })
+    (map-set wellness-tier-thresholds { tier: u4 } 
+      { min-score: u71, max-score: u85, premium-discount: u15, tier-name: "Excellent" })
+    (map-set wellness-tier-thresholds { tier: u5 } 
+      { min-score: u86, max-score: u100, premium-discount: u20, tier-name: "Optimal" })
+  )
+)
+
+(define-read-only (get-pet-wellness-score (policy-id uint))
+  (map-get? pet-wellness-scores { policy-id: policy-id })
+)
+
+(define-read-only (get-wellness-tier-info (tier uint))
+  (map-get? wellness-tier-thresholds { tier: tier })
+)
+
+(define-read-only (get-wellness-activity (policy-id uint) (activity-id uint))
+  (map-get? wellness-activities { policy-id: policy-id, activity-id: activity-id })
+)
+
+(define-read-only (get-wellness-settings)
+  {
+    base-score: (var-get base-wellness-score),
+    max-score: (var-get max-wellness-score),
+    decay-rate: (var-get wellness-decay-rate),
+    checkup-bonus: (var-get checkup-score-bonus),
+    vaccination-bonus: (var-get vaccination-score-bonus),
+    preventive-bonus: (var-get preventive-care-bonus)
+  }
+)
+
+(define-private (calculate-wellness-tier (score uint))
+  (if (<= score u30) u1
+    (if (<= score u50) u2
+      (if (<= score u70) u3
+        (if (<= score u85) u4
+          u5))))
+)
+
+(define-private (calculate-wellness-decay (last-updated uint) (current-score uint))
+  (let
+    (
+      (blocks-passed (- stacks-block-height last-updated))
+      (months-passed (/ blocks-passed u4320))
+      (decay-amount (* months-passed (var-get wellness-decay-rate)))
+    )
+    (if (> decay-amount current-score)
+      u0
+      (- current-score decay-amount))
+  )
+)
+
+(define-public (record-wellness-activity
+    (policy-id uint)
+    (activity-type (string-ascii 32))
+    (description (string-ascii 128)))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+      (vet-data (map-get? vet-principals { principal: tx-sender }))
+      (activity-counts (default-to { activity-count: u0 } 
+        (map-get? policy-wellness-activities { policy-id: policy-id })))
+      (activity-id (get activity-count activity-counts))
+      (score-bonus (if (is-eq activity-type "checkup") (var-get checkup-score-bonus)
+        (if (is-eq activity-type "vaccination") (var-get vaccination-score-bonus)
+          (if (is-eq activity-type "preventive") (var-get preventive-care-bonus)
+            u0))))
+    )
+    (asserts! (get active policy) err-unauthorized)
+    (asserts! (is-some vet-data) err-not-vet)
+    
+    (map-set wellness-activities
+      { policy-id: policy-id, activity-id: activity-id }
+      {
+        activity-type: activity-type,
+        score-impact: score-bonus,
+        recorded-by: tx-sender,
+        timestamp: stacks-block-height,
+        description: description
+      }
+    )
+    
+    (map-set policy-wellness-activities
+      { policy-id: policy-id }
+      { activity-count: (+ activity-id u1) }
+    )
+    
+    (try! (update-wellness-score policy-id))
+    
+    (ok activity-id)
+  )
+)
+
+(define-public (update-wellness-score (policy-id uint))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+      (current-wellness (default-to
+        {
+          current-score: (var-get base-wellness-score),
+          last-updated: stacks-block-height,
+          total-checkups: u0,
+          recent-checkups: u0,
+          vaccination-status: u0,
+          preventive-care-count: u0,
+          wellness-tier: u2,
+          premium-discount: u5
+        }
+        (map-get? pet-wellness-scores { policy-id: policy-id })))
+    )
+    (asserts! (get active policy) err-unauthorized)
+    
+    (let
+      (
+        (decayed-score (calculate-wellness-decay 
+          (get last-updated current-wellness) 
+          (get current-score current-wellness)))
+        (recent-checkup-count (count-recent-activities policy-id "checkup"))
+        (vaccination-count (count-recent-activities policy-id "vaccination"))
+        (preventive-count (count-recent-activities policy-id "preventive"))
+        (checkup-bonus (* recent-checkup-count (var-get checkup-score-bonus)))
+        (vaccination-bonus (* vaccination-count (var-get vaccination-score-bonus)))
+        (preventive-bonus (* preventive-count (var-get preventive-care-bonus)))
+        (calculated-score (+ decayed-score checkup-bonus vaccination-bonus preventive-bonus))
+        (new-score (if (> calculated-score (var-get max-wellness-score)) 
+          (var-get max-wellness-score) 
+          calculated-score))
+        (new-tier (calculate-wellness-tier new-score))
+        (tier-info (unwrap! (map-get? wellness-tier-thresholds { tier: new-tier }) err-invalid-wellness-tier))
+        (new-discount (get premium-discount tier-info))
+      )
+      
+      (map-set pet-wellness-scores
+        { policy-id: policy-id }
+        {
+          current-score: new-score,
+          last-updated: stacks-block-height,
+          total-checkups: (+ (get total-checkups current-wellness) recent-checkup-count),
+          recent-checkups: recent-checkup-count,
+          vaccination-status: (if (> (* vaccination-count u25) u100) u100 (* vaccination-count u25)),
+          preventive-care-count: (+ (get preventive-care-count current-wellness) preventive-count),
+          wellness-tier: new-tier,
+          premium-discount: new-discount
+        }
+      )
+      
+      (ok new-score)
+    )
+  )
+)
+
+(define-private (count-recent-activities (policy-id uint) (activity-type (string-ascii 32)))
+  (let
+    (
+      (activity-counts (default-to { activity-count: u0 } 
+        (map-get? policy-wellness-activities { policy-id: policy-id })))
+      (total-activities (get activity-count activity-counts))
+      (six-months-ago (- stacks-block-height u25920))
+    )
+    (get count (fold count-recent-activity-helper 
+      (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9)
+      { count: u0, policy-id: policy-id, activity-type: activity-type, cutoff: six-months-ago, max-id: total-activities }))
+  )
+)
+
+(define-private (count-recent-activity-helper 
+    (activity-index uint) 
+    (accumulator { count: uint, policy-id: uint, activity-type: (string-ascii 32), cutoff: uint, max-id: uint }))
+  (if (>= activity-index (get max-id accumulator))
+    accumulator
+    (match (map-get? wellness-activities { policy-id: (get policy-id accumulator), activity-id: activity-index })
+      activity-data
+      (if (and 
+            (is-eq (get activity-type activity-data) (get activity-type accumulator))
+            (>= (get timestamp activity-data) (get cutoff accumulator)))
+        (merge accumulator { count: (+ (get count accumulator) u1) })
+        accumulator)
+      accumulator)
+  )
+)
+
+(define-read-only (calculate-wellness-premium (base-premium uint) (policy-id uint))
+  (match (map-get? pet-wellness-scores { policy-id: policy-id })
+    wellness-data
+    (let
+      (
+        (discount-percentage (get premium-discount wellness-data))
+        (discount-amount (/ (* base-premium discount-percentage) u100))
+      )
+      {
+        base-premium: base-premium,
+        wellness-discount: discount-percentage,
+        discount-amount: discount-amount,
+        final-premium: (- base-premium discount-amount),
+        wellness-tier: (get wellness-tier wellness-data),
+        wellness-score: (get current-score wellness-data)
+      }
+    )
+    {
+      base-premium: base-premium,
+      wellness-discount: u0,
+      discount-amount: u0,
+      final-premium: base-premium,
+      wellness-tier: u2,
+      wellness-score: (var-get base-wellness-score)
+    }
+  )
+)
+
+(define-public (initialize-wellness-score (policy-id uint))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get owner policy)) err-unauthorized)
+    (asserts! (get active policy) err-unauthorized)
+    (asserts! (is-none (map-get? pet-wellness-scores { policy-id: policy-id })) err-policy-exists)
+    
+    (map-set pet-wellness-scores
+      { policy-id: policy-id }
+      {
+        current-score: (var-get base-wellness-score),
+        last-updated: stacks-block-height,
+        total-checkups: u0,
+        recent-checkups: u0,
+        vaccination-status: u0,
+        preventive-care-count: u0,
+        wellness-tier: u2,
+        premium-discount: u5
+      }
+    )
+    
+    (map-set policy-wellness-activities
+      { policy-id: policy-id }
+      { activity-count: u0 }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-wellness-settings
+    (base-score uint)
+    (max-score uint)
+    (decay-rate uint)
+    (checkup-bonus uint)
+    (vaccination-bonus uint)
+    (preventive-bonus uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (> max-score base-score) (<= max-score u100)) err-invalid-amount)
+    (asserts! (<= decay-rate u20) err-invalid-amount)
+    
+    (var-set base-wellness-score base-score)
+    (var-set max-wellness-score max-score)
+    (var-set wellness-decay-rate decay-rate)
+    (var-set checkup-score-bonus checkup-bonus)
+    (var-set vaccination-score-bonus vaccination-bonus)
+    (var-set preventive-care-bonus preventive-bonus)
+    
+    (ok true)
+  )
+)
+
+(define-public (bulk-update-wellness-scores (policy-ids (list 10 uint)))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (ok (map update-wellness-score policy-ids))
+  )
+)
+
 (init-discount-tiers)
+(init-wellness-tiers)
+
+
+
