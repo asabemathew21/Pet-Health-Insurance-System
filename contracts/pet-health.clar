@@ -1155,8 +1155,396 @@
   )
 )
 
+;; ----- Pet Vaccination and Health Alert System -----
+
+;; Vaccination alert system error constants
+(define-constant err-vaccination-not-found (err u200))
+(define-constant err-vaccination-exists (err u201))
+(define-constant err-invalid-vaccination-type (err u202))
+(define-constant err-alert-not-found (err u203))
+(define-constant err-alert-already-acknowledged (err u204))
+(define-constant err-vaccination-overdue (err u205))
+(define-constant err-invalid-alert-type (err u206))
+
+;; Vaccination system data variables
+(define-data-var next-vaccination-id uint u1)
+(define-data-var next-alert-id uint u1)
+(define-data-var overdue-penalty-rate uint u10) ;; 10% premium increase for overdue vaccinations
+(define-data-var compliance-bonus-rate uint u5)  ;; 5% premium discount for excellent compliance
+
+;; Vaccination schedule and tracking
+(define-map vaccination-schedules
+  { policy-id: uint, vaccination-type: (string-ascii 30) }
+  {
+    last-vaccination-date: uint,
+    next-due-date: uint,
+    frequency-blocks: uint, ;; blocks between required vaccinations
+    priority-level: uint, ;; 1-5 (5 being critical)
+    vet-administered: principal,
+    is-overdue: bool,
+    compliance-score: uint ;; 0-100
+  }
+)
+
+;; Health alerts for pets
+(define-map health-alerts
+  { alert-id: uint }
+  {
+    policy-id: uint,
+    alert-type: (string-ascii 20), ;; "vaccination", "checkup", "emergency", "milestone"
+    title: (string-ascii 50),
+    description: (string-ascii 200),
+    priority: uint, ;; 1-5
+    created-at: uint,
+    due-date: uint,
+    acknowledged: bool,
+    acknowledged-by: (optional principal),
+    acknowledged-at: (optional uint)
+  }
+)
+
+;; Policy alert tracking
+(define-map policy-alerts
+  { policy-id: uint }
+  {
+    total-alerts: uint,
+    pending-alerts: uint,
+    overdue-alerts: uint
+  }
+)
+
+;; Pet breed-specific health milestones
+(define-map breed-health-milestones
+  { species: (string-ascii 32), age-months: uint }
+  {
+    milestone-name: (string-ascii 40),
+    description: (string-ascii 150),
+    recommended-action: (string-ascii 100),
+    priority: uint
+  }
+)
+
+;; Initialize standard vaccination schedules
+(define-private (init-vaccination-types)
+  (begin
+    ;; Dog vaccinations
+    (map-set breed-health-milestones { species: "Dog", age-months: u8 }
+      { milestone-name: "Puppy Core Vaccines", 
+        description: "DHPP vaccination series completion", 
+        recommended-action: "Schedule DHPP booster with vet", 
+        priority: u5 })
+    (map-set breed-health-milestones { species: "Dog", age-months: u12 }
+      { milestone-name: "Annual Rabies Vaccination", 
+        description: "Required rabies vaccination", 
+        recommended-action: "Schedule rabies vaccination", 
+        priority: u5 })
+    
+    ;; Cat vaccinations
+    (map-set breed-health-milestones { species: "Cat", age-months: u8 }
+      { milestone-name: "Kitten Core Vaccines", 
+        description: "FVRCP vaccination series", 
+        recommended-action: "Complete FVRCP vaccination series", 
+        priority: u5 })
+    (map-set breed-health-milestones { species: "Cat", age-months: u12 }
+      { milestone-name: "Annual Wellness Check", 
+        description: "Comprehensive health examination", 
+        recommended-action: "Schedule annual exam and vaccinations", 
+        priority: u4 })
+  )
+)
+
+;; Schedule vaccination for a pet
+(define-public (schedule-vaccination
+    (policy-id uint)
+    (vaccination-type (string-ascii 30))
+    (frequency-blocks uint)
+    (priority-level uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (vet-data (map-get? vet-principals { principal: tx-sender }))
+  )
+    ;; Check authorization
+    (asserts! (or 
+      (is-eq tx-sender (get owner policy))
+      (is-some vet-data)
+    ) err-unauthorized)
+    (asserts! (get active policy) err-unauthorized)
+    (asserts! (and (>= priority-level u1) (<= priority-level u5)) err-invalid-amount)
+    
+    ;; Create vaccination schedule
+    (map-set vaccination-schedules
+      { policy-id: policy-id, vaccination-type: vaccination-type }
+      {
+        last-vaccination-date: u0,
+        next-due-date: (+ stacks-block-height frequency-blocks),
+        frequency-blocks: frequency-blocks,
+        priority-level: priority-level,
+        vet-administered: tx-sender,
+        is-overdue: false,
+        compliance-score: u100
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Record vaccination administration
+(define-public (administer-vaccination
+    (policy-id uint)
+    (vaccination-type (string-ascii 30)))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (vaccination (unwrap! (map-get? vaccination-schedules { policy-id: policy-id, vaccination-type: vaccination-type }) err-vaccination-not-found))
+    (vet-data (unwrap! (map-get? vet-principals { principal: tx-sender }) err-not-vet))
+  )
+    ;; Check authorization
+    (asserts! (get active policy) err-unauthorized)
+    
+    ;; Update vaccination record
+    (map-set vaccination-schedules
+      { policy-id: policy-id, vaccination-type: vaccination-type }
+      (merge vaccination {
+        last-vaccination-date: stacks-block-height,
+        next-due-date: (+ stacks-block-height (get frequency-blocks vaccination)),
+        vet-administered: tx-sender,
+        is-overdue: false,
+        compliance-score: (if (> (get compliance-score vaccination) u95) u100 (+ (get compliance-score vaccination) u5))
+      })
+    )
+    
+    ;; Add to wellness activities
+    (try! (record-wellness-activity policy-id "vaccination" vaccination-type))
+    
+    (ok true)
+  )
+)
+
+;; Create health alert
+(define-public (create-health-alert
+    (policy-id uint)
+    (alert-type (string-ascii 20))
+    (title (string-ascii 50))
+    (description (string-ascii 200))
+    (priority uint)
+    (due-date uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (alert-id (var-get next-alert-id))
+    (current-alerts (default-to { total-alerts: u0, pending-alerts: u0, overdue-alerts: u0 }
+      (map-get? policy-alerts { policy-id: policy-id })))
+  )
+    ;; Check authorization - owner, vet, or contract owner can create alerts
+    (asserts! (or 
+      (is-eq tx-sender (get owner policy))
+      (is-some (map-get? vet-principals { principal: tx-sender }))
+      (is-eq tx-sender contract-owner)
+    ) err-unauthorized)
+    (asserts! (get active policy) err-unauthorized)
+    (asserts! (and (>= priority u1) (<= priority u5)) err-invalid-amount)
+    
+    ;; Create alert
+    (map-set health-alerts
+      { alert-id: alert-id }
+      {
+        policy-id: policy-id,
+        alert-type: alert-type,
+        title: title,
+        description: description,
+        priority: priority,
+        created-at: stacks-block-height,
+        due-date: due-date,
+        acknowledged: false,
+        acknowledged-by: none,
+        acknowledged-at: none
+      }
+    )
+    
+    ;; Update policy alert counts
+    (map-set policy-alerts
+      { policy-id: policy-id }
+      {
+        total-alerts: (+ (get total-alerts current-alerts) u1),
+        pending-alerts: (+ (get pending-alerts current-alerts) u1),
+        overdue-alerts: (if (> stacks-block-height due-date) 
+          (+ (get overdue-alerts current-alerts) u1)
+          (get overdue-alerts current-alerts))
+      }
+    )
+    
+    (var-set next-alert-id (+ alert-id u1))
+    (ok alert-id)
+  )
+)
+
+;; Acknowledge health alert
+(define-public (acknowledge-alert (alert-id uint))
+  (let (
+    (alert (unwrap! (map-get? health-alerts { alert-id: alert-id }) err-alert-not-found))
+    (policy (unwrap! (map-get? policies { policy-id: (get policy-id alert) }) err-not-found))
+    (current-alerts (default-to { total-alerts: u0, pending-alerts: u0, overdue-alerts: u0 }
+      (map-get? policy-alerts { policy-id: (get policy-id alert) })))
+  )
+    ;; Check authorization
+    (asserts! (is-eq tx-sender (get owner policy)) err-unauthorized)
+    (asserts! (not (get acknowledged alert)) err-alert-already-acknowledged)
+    
+    ;; Update alert
+    (map-set health-alerts
+      { alert-id: alert-id }
+      (merge alert {
+        acknowledged: true,
+        acknowledged-by: (some tx-sender),
+        acknowledged-at: (some stacks-block-height)
+      })
+    )
+    
+    ;; Update policy alert counts
+    (map-set policy-alerts
+      { policy-id: (get policy-id alert) }
+      (merge current-alerts {
+        pending-alerts: (if (> (get pending-alerts current-alerts) u0) 
+          (- (get pending-alerts current-alerts) u1) 
+          u0)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Check and update vaccination compliance
+(define-public (check-vaccination-compliance (policy-id uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (rabies-schedule (map-get? vaccination-schedules { policy-id: policy-id, vaccination-type: "rabies" }))
+    (core-schedule (map-get? vaccination-schedules { policy-id: policy-id, vaccination-type: "core-vaccines" }))
+  )
+    (asserts! (get active policy) err-unauthorized)
+    
+    ;; Check rabies vaccination compliance
+    (match rabies-schedule
+      rabies-data (if (> stacks-block-height (get next-due-date rabies-data))
+        (begin
+          (map-set vaccination-schedules
+            { policy-id: policy-id, vaccination-type: "rabies" }
+            (merge rabies-data { 
+              is-overdue: true,
+              compliance-score: (if (> (get compliance-score rabies-data) u15) 
+                (- (get compliance-score rabies-data) u15) u0)
+            })
+          )
+          ;; Create overdue alert
+          (unwrap-panic (create-health-alert policy-id "vaccination" "Rabies Vaccination Overdue" 
+            "Pet's rabies vaccination is overdue. Schedule immediately." u5 (get next-due-date rabies-data)))
+          true
+        )
+        true
+      )
+      true
+    )
+    
+    ;; Check core vaccines compliance
+    (match core-schedule
+      core-data (if (> stacks-block-height (get next-due-date core-data))
+        (begin
+          (map-set vaccination-schedules
+            { policy-id: policy-id, vaccination-type: "core-vaccines" }
+            (merge core-data { 
+              is-overdue: true,
+              compliance-score: (if (> (get compliance-score core-data) u10) 
+                (- (get compliance-score core-data) u10) u0)
+            })
+          )
+          true
+        )
+        true
+      )
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+;; Calculate vaccination compliance premium adjustment
+(define-public (calculate-vaccination-premium-adjustment (policy-id uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (rabies-schedule (map-get? vaccination-schedules { policy-id: policy-id, vaccination-type: "rabies" }))
+    (core-schedule (map-get? vaccination-schedules { policy-id: policy-id, vaccination-type: "core-vaccines" }))
+    (rabies-compliance (match rabies-schedule 
+      data (get compliance-score data) u50))
+    (core-compliance (match core-schedule 
+      data (get compliance-score data) u50))
+    (average-compliance (/ (+ rabies-compliance core-compliance) u2))
+    (adjustment (if (>= average-compliance u90)
+      (var-get compliance-bonus-rate) ;; Discount for excellent compliance
+      (if (< average-compliance u60)
+        (var-get overdue-penalty-rate) ;; Penalty for poor compliance
+        u0))) ;; No adjustment for moderate compliance
+  )
+    (asserts! (get active policy) err-unauthorized)
+    
+    (ok {
+      rabies-compliance: rabies-compliance,
+      core-compliance: core-compliance,
+      average-compliance: average-compliance,
+      adjustment-type: (if (>= average-compliance u90) "discount" 
+        (if (< average-compliance u60) "penalty" "none")),
+      adjustment-percentage: adjustment
+    })
+  )
+)
+
+;; Read-only functions for vaccination system
+(define-read-only (get-vaccination-schedule (policy-id uint) (vaccination-type (string-ascii 30)))
+  (map-get? vaccination-schedules { policy-id: policy-id, vaccination-type: vaccination-type })
+)
+
+(define-read-only (get-health-alert (alert-id uint))
+  (map-get? health-alerts { alert-id: alert-id })
+)
+
+(define-read-only (get-policy-alert-summary (policy-id uint))
+  (map-get? policy-alerts { policy-id: policy-id })
+)
+
+(define-read-only (get-breed-milestone (species (string-ascii 32)) (age-months uint))
+  (map-get? breed-health-milestones { species: species, age-months: age-months })
+)
+
+(define-read-only (get-vaccination-system-settings)
+  {
+    overdue-penalty-rate: (var-get overdue-penalty-rate),
+    compliance-bonus-rate: (var-get compliance-bonus-rate),
+    total-vaccination-types: u2, ;; rabies and core-vaccines
+    total-alerts: (- (var-get next-alert-id) u1)
+  }
+)
+
+(define-read-only (check-policy-compliance-status (policy-id uint))
+  (let (
+    (rabies-schedule (map-get? vaccination-schedules { policy-id: policy-id, vaccination-type: "rabies" }))
+    (core-schedule (map-get? vaccination-schedules { policy-id: policy-id, vaccination-type: "core-vaccines" }))
+    (rabies-overdue (match rabies-schedule 
+      data (get is-overdue data) false))
+    (core-overdue (match core-schedule 
+      data (get is-overdue data) false))
+  )
+    {
+      rabies-compliant: (not rabies-overdue),
+      core-vaccines-compliant: (not core-overdue),
+      overall-compliance: (if (and (not rabies-overdue) (not core-overdue)) "compliant" 
+        (if (or rabies-overdue core-overdue) "overdue" "partial")),
+      needs-attention: (or rabies-overdue core-overdue)
+    }
+  )
+)
+
 (init-discount-tiers)
 (init-wellness-tiers)
+(init-vaccination-types)
 
 
 
